@@ -1,122 +1,95 @@
 #include <bang.h>
-#include <torch/extension.h>
 #include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
 
-#define CHUNK_SIZE 4096
+#define TILE_ELEM 16384
+#define TASK_ELEM_SLICE TILE_ELEM
+#define TASK_NUM 32
 
-__mlu_entry__ void leakyrelu_kernel(
-    float *input,
-    float *output,
-    int total,
-    float negative_slope) {
+__mlu_entry__ void LeakyReLUKernel(const float *x, float *y, uint32_t total,
+                                   float negative_slope) {
+  __nram__ float nram_x[TILE_ELEM];
+  __nram__ float nram_scaled[TILE_ELEM];
+  __nram__ float nram_y[TILE_ELEM];
 
-    // 多核拆分参数
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = total / core_num;
-    uint32_t remainder = total % core_num; // 修正笔误
+  for (uint32_t global_start = taskId * TASK_ELEM_SLICE; global_start < total;
+       global_start += taskDim * TASK_ELEM_SLICE) {
+    uint32_t chunk = total - global_start;
+    if (chunk > TASK_ELEM_SLICE) chunk = TASK_ELEM_SLICE;
 
-    uint32_t start = core_id * per_core +
-                     (core_id < remainder ? core_id : remainder);
+    for (uint32_t offset = 0; offset < chunk; offset += TILE_ELEM) {
+      uint32_t tile = chunk - offset;
+      if (tile > TILE_ELEM) tile = TILE_ELEM;
 
-    uint32_t count = per_core +
-                     (core_id < remainder ? 1 : 0);
+      __memcpy(nram_x, x + global_start + offset, tile * sizeof(float),
+               GDRAM2NRAM);
 
-    // NRAM
-    __nram__ float nram_input[CHUNK_SIZE];
-    __nram__ float nram_relu[CHUNK_SIZE];
-    __nram__ float nram_temp[CHUNK_SIZE];
+      __bang_mul_scalar(nram_scaled, nram_x, negative_slope, tile);
+      __bang_maximum(nram_y, nram_x, nram_scaled, tile);
 
-    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
-
-        uint32_t len =
-            (offset + CHUNK_SIZE <= count)
-                ? CHUNK_SIZE
-                : (count - offset);
-
-        uint32_t aligned_len = (len + 63) & ~63;
-
-        __memcpy(
-            nram_input,
-            input + start + offset,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-        // relu(x)
-        __bang_active_relu(
-            nram_relu,
-            nram_input,
-            aligned_len);
-
-        // min(0,x)
-        __bang_sub(
-            nram_temp,
-            nram_input,
-            nram_relu,
-            aligned_len);
-
-        // negative_slope * min(0,x)
-        __bang_mul_scalar(
-            nram_temp,
-            nram_temp,
-            negative_slope,
-            aligned_len);
-
-        // relu + scaled negative
-        __bang_add(
-            nram_temp,
-            nram_relu,
-            nram_temp,
-            aligned_len);
-
-        __memcpy(
-            output + start + offset,
-            nram_temp,
-            len * sizeof(float),
-            NRAM2GDRAM);
+      __memcpy(y + global_start + offset, nram_y, tile * sizeof(float),
+               NRAM2GDRAM);
     }
+  }
 }
 
+__mlu_entry__ void LeakyReLUHalfKernel(const half *x, half *y, uint32_t total,
+                                       half negative_slope) {
+  __nram__ half nram_x[TILE_ELEM];
+  __nram__ half nram_scaled[TILE_ELEM];
+  __nram__ half nram_y[TILE_ELEM];
 
-torch::Tensor bang_func(
-    torch::Tensor input,
-    double negative_slope) {
+  for (uint32_t global_start = taskId * TASK_ELEM_SLICE; global_start < total;
+       global_start += taskDim * TASK_ELEM_SLICE) {
+    uint32_t chunk = total - global_start;
+    if (chunk > TASK_ELEM_SLICE) chunk = TASK_ELEM_SLICE;
 
-    TORCH_CHECK(
-        input.is_contiguous(),
-        "Input must be contiguous");
+    for (uint32_t offset = 0; offset < chunk; offset += TILE_ELEM) {
+      uint32_t tile = chunk - offset;
+      if (tile > TILE_ELEM) tile = TILE_ELEM;
 
-    // 保留原始 dtype
-    auto original_dtype = input.scalar_type();
+      __memcpy(nram_x, x + global_start + offset, tile * sizeof(half),
+               GDRAM2NRAM);
 
-    // -------- 只处理数据类型 --------
-    torch::Tensor input_fp32 = input;
-    if (original_dtype != torch::kFloat) {
-        input_fp32 = input.to(torch::kFloat);
+      __bang_mul_scalar(nram_scaled, nram_x, negative_slope, tile);
+      __bang_maximum(nram_y, nram_x, nram_scaled, tile);
+
+      __memcpy(y + global_start + offset, nram_y, tile * sizeof(half),
+               NRAM2GDRAM);
     }
+  }
+}
 
-    auto output_fp32 = torch::empty_like(input_fp32);
+torch::Tensor bang_func(torch::Tensor input, double negative_slope) {
+  auto output = input.new_empty(input.sizes());
+  uint32_t total = (uint32_t)input.numel();
+  if (total == 0) return output;
 
-    int total = input_fp32.numel();
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-    cnrtQueue_t queue =
-        torch_mlu::getCurMLUStream();
+  if (input.element_size() == sizeof(float)) {
+    LeakyReLUKernel<<<task_dim, ktype, queue>>>(input.data_ptr<float>(),
+                                                output.data_ptr<float>(), total,
+                                                (float)negative_slope);
+  } else {
+    LeakyReLUHalfKernel<<<task_dim, ktype, queue>>>(
+        (const half *)input.data_ptr(), (half *)output.data_ptr(), total,
+        (half)((float)negative_slope));
+  }
+  return output;
+}
 
-    cnrtDim3_t dim = {4,1,1};
-    cnrtFunctionType_t ktype =
-        cnrtFuncTypeUnion1;
+void bang_func_raw(float *output, const float *input, int batch, int dim,
+                   float negative_slope, cnrtQueue_t queue) {
+  uint32_t total = (uint32_t)batch * (uint32_t)dim;
+  if (total == 0) return;
 
-    leakyrelu_kernel<<<dim, ktype, queue>>>(
-        input_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        total,
-        (float)negative_slope
-    );
-
-    // 转回原 dtype
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
-    }
-
-    return output_fp32;
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+  LeakyReLUKernel<<<task_dim, ktype, queue>>>(input, output, total,
+                                              negative_slope);
 }
