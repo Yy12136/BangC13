@@ -1,0 +1,75 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define TASK_NUM 8
+
+__mlu_entry__ void GatherHalfKernel(const half *x, const int32_t *indices,
+                                    const int32_t *bin_ids,
+                                    const half *weights, const int32_t *bins,
+                                    half *out, int num_elements,
+                                    int hidden_size, int top_k) {
+  for (int pid = taskId; pid < num_elements; pid += taskDim) {
+    int bin_id = bin_ids[pid];
+    int bin_start = (bin_id == 0) ? 0 : bins[bin_id - 1];
+    int index_b = pid - bin_start + bin_start;
+    int index_a = indices[pid];
+    int src_row = index_a / top_k;
+    half scale = weights[index_a];
+
+    for (int col = 0; col < hidden_size; ++col) {
+      out[index_b * hidden_size + col] =
+          (half)((float)x[src_row * hidden_size + col] * (float)scale);
+    }
+  }
+}
+
+__mlu_entry__ void GatherFloatKernel(const float *x, const int32_t *indices,
+                                     const int32_t *bin_ids,
+                                     const float *weights, const int32_t *bins,
+                                     float *out, int num_elements,
+                                     int hidden_size, int top_k) {
+  for (int pid = taskId; pid < num_elements; pid += taskDim) {
+    int bin_id = bin_ids[pid];
+    int bin_start = (bin_id == 0) ? 0 : bins[bin_id - 1];
+    int index_b = pid - bin_start + bin_start;
+    int index_a = indices[pid];
+    int src_row = index_a / top_k;
+    float scale = weights[index_a];
+
+    for (int col = 0; col < hidden_size; ++col) {
+      out[index_b * hidden_size + col] =
+          x[src_row * hidden_size + col] * scale;
+    }
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor indices,
+                        torch::Tensor bin_ids, torch::Tensor weights,
+                        torch::Tensor bins, int top_k) {
+  auto output = x.new_empty({x.size(0) * top_k, x.size(1)});
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  int num_elements = (int)indices.numel();
+  int hidden_size = (int)x.size(1);
+
+  if (x.element_size() == sizeof(float)) {
+    GatherFloatKernel<<<task_dim, ktype, queue>>>(
+        x.data_ptr<float>(), indices.data_ptr<int32_t>(),
+        bin_ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
+        bins.data_ptr<int32_t>(), output.data_ptr<float>(), num_elements,
+        hidden_size, top_k);
+  } else {
+    GatherHalfKernel<<<task_dim, ktype, queue>>>(
+        (const half *)x.data_ptr(), indices.data_ptr<int32_t>(),
+        bin_ids.data_ptr<int32_t>(), (const half *)weights.data_ptr(),
+        bins.data_ptr<int32_t>(), (half *)output.data_ptr(), num_elements,
+        hidden_size, top_k);
+  }
+  return output;
+}

@@ -1,0 +1,132 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define TASK_NUM 32
+#define TOTAL_ELEM 131072
+#define TILE_ELEM 8192
+
+__mlu_entry__ void KLPartialFloatKernel(const float *input_log_prob,
+                                        const float *target_prob,
+                                        float *partials) {
+  __nram__ float nram_input[TILE_ELEM];
+  __nram__ float nram_target[TILE_ELEM];
+  __nram__ float nram_log[TILE_ELEM];
+  __nram__ float nram_term[TILE_ELEM];
+  float local_sum = 0.0f;
+
+  for (uint32_t start = taskId * TILE_ELEM; start < TOTAL_ELEM;
+       start += taskDim * TILE_ELEM) {
+    __memcpy(nram_input, input_log_prob + start, TILE_ELEM * sizeof(float),
+             GDRAM2NRAM);
+    __memcpy(nram_target, target_prob + start, TILE_ELEM * sizeof(float),
+             GDRAM2NRAM);
+    __bang_log2(nram_log, nram_target, TILE_ELEM);
+    __bang_mul_scalar(nram_log, nram_log, 0.6931471805599453f, TILE_ELEM);
+    __bang_sub(nram_log, nram_log, nram_input, TILE_ELEM);
+    __bang_mul(nram_term, nram_target, nram_log, TILE_ELEM);
+    __sync_compute();
+    for (uint32_t i = 0; i < TILE_ELEM; ++i) {
+      local_sum += nram_term[i];
+    }
+  }
+
+  nram_term[0] = local_sum / 128.0f;
+  __memcpy(partials + taskId, nram_term, sizeof(float), NRAM2GDRAM);
+}
+
+__mlu_entry__ void KLReduceFloatKernel(const float *partials, float *out) {
+  __nram__ float nram_partials[64];
+  __nram__ float nram_out[64];
+
+  __memcpy(nram_partials, partials, TASK_NUM * sizeof(float), GDRAM2NRAM);
+  __bang_write_value(nram_partials + TASK_NUM, 64 - TASK_NUM, 0.0f);
+  __sync_compute();
+  nram_out[0] = 0.0f;
+  for (uint32_t i = 0; i < 64; ++i) {
+    nram_out[0] += nram_partials[i];
+  }
+  __memcpy(out, nram_out, sizeof(float), NRAM2GDRAM);
+}
+
+__mlu_entry__ void KLPartialHalfKernel(const half *input_log_prob,
+                                       const half *target_prob,
+                                       half *partials) {
+  __nram__ half nram_input_h[TILE_ELEM];
+  __nram__ half nram_target_h[TILE_ELEM];
+  __nram__ half nram_partial_h[64];
+  __nram__ float nram_input[TILE_ELEM];
+  __nram__ float nram_target[TILE_ELEM];
+  __nram__ float nram_log[TILE_ELEM];
+  __nram__ float nram_term[TILE_ELEM];
+  __nram__ float nram_partial[64];
+  float local_sum = 0.0f;
+
+  for (uint32_t start = taskId * TILE_ELEM; start < TOTAL_ELEM;
+       start += taskDim * TILE_ELEM) {
+    __memcpy(nram_input_h, input_log_prob + start, TILE_ELEM * sizeof(half),
+             GDRAM2NRAM);
+    __memcpy(nram_target_h, target_prob + start, TILE_ELEM * sizeof(half),
+             GDRAM2NRAM);
+    __bang_half2float(nram_input, nram_input_h, TILE_ELEM);
+    __bang_half2float(nram_target, nram_target_h, TILE_ELEM);
+    __bang_log2(nram_log, nram_target, TILE_ELEM);
+    __bang_mul_scalar(nram_log, nram_log, 0.6931471805599453f, TILE_ELEM);
+    __bang_sub(nram_log, nram_log, nram_input, TILE_ELEM);
+    __bang_mul(nram_term, nram_target, nram_log, TILE_ELEM);
+    __sync_compute();
+    for (uint32_t i = 0; i < TILE_ELEM; ++i) {
+      local_sum += nram_term[i];
+    }
+  }
+
+  nram_partial[0] = local_sum / 128.0f;
+  __bang_float2half_rn(nram_partial_h, nram_partial, 1);
+  __memcpy(partials + taskId, nram_partial_h, sizeof(half), NRAM2GDRAM);
+}
+
+__mlu_entry__ void KLReduceHalfKernel(const half *partials, half *out) {
+  __nram__ half nram_partials_h[64];
+  __nram__ half nram_out_h[64];
+  __nram__ float nram_partials[64];
+  __nram__ float nram_out[64];
+
+  __memcpy(nram_partials_h, partials, TASK_NUM * sizeof(half), GDRAM2NRAM);
+  __bang_half2float(nram_partials, nram_partials_h, 64);
+  __bang_write_value(nram_partials + TASK_NUM, 64 - TASK_NUM, 0.0f);
+  __sync_compute();
+  nram_out[0] = 0.0f;
+  for (uint32_t i = 0; i < 64; ++i) {
+    nram_out[0] += nram_partials[i];
+  }
+  __bang_float2half_rn(nram_out_h, nram_out, 1);
+  __memcpy(out, nram_out_h, sizeof(half), NRAM2GDRAM);
+}
+
+torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
+  auto output = input_log_prob.new_empty({});
+  auto partials = input_log_prob.new_empty({TASK_NUM});
+  if (input_log_prob.numel() == 0) return output;
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t partial_dim = {TASK_NUM, 1, 1};
+  cnrtDim3_t reduce_dim = {1, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  if (input_log_prob.element_size() == sizeof(float)) {
+    KLPartialFloatKernel<<<partial_dim, ktype, queue>>>(
+        input_log_prob.data_ptr<float>(), target_prob.data_ptr<float>(),
+        partials.data_ptr<float>());
+    KLReduceFloatKernel<<<reduce_dim, ktype, queue>>>(
+        partials.data_ptr<float>(), output.data_ptr<float>());
+  } else {
+    KLPartialHalfKernel<<<partial_dim, ktype, queue>>>(
+        (const half *)input_log_prob.data_ptr(), (const half *)target_prob.data_ptr(),
+        (half *)partials.data_ptr());
+    KLReduceHalfKernel<<<reduce_dim, ktype, queue>>>(
+        (const half *)partials.data_ptr(), (half *)output.data_ptr());
+  }
+  return output;
+}

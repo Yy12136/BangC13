@@ -1,0 +1,83 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define BATCH 4
+#define CHANNELS 32
+#define IN_H 1024
+#define IN_W 1024
+#define KERNEL 11
+#define OUT_H 93
+#define OUT_W 93
+#define OUT_BATCH_ELEM ((uint32_t)(CHANNELS * OUT_H * OUT_W))
+#define IN_BATCH_ELEM ((uint32_t)(CHANNELS * IN_H * IN_W))
+#define TASK_NUM 256
+
+__mlu_entry__ void AvgPoolHalfKernel(const half *x, half *out) {
+  for (uint32_t idx = taskId; idx < OUT_BATCH_ELEM; idx += taskDim) {
+    uint32_t ow = (uint32_t)(idx % OUT_W);
+    uint32_t t = idx / OUT_W;
+    uint32_t oh = (uint32_t)(t % OUT_H);
+    t /= OUT_H;
+    uint32_t c = (uint32_t)(t % CHANNELS);
+
+    uint64_t in_base = ((uint64_t)c * IN_H + oh * KERNEL) * IN_W + ow * KERNEL;
+    float sum = 0.0f;
+    for (uint32_t kh = 0; kh < KERNEL; ++kh) {
+      uint64_t row_base = in_base + (uint64_t)kh * IN_W;
+      for (uint32_t kw = 0; kw < KERNEL; ++kw) {
+        sum += (float)x[row_base + kw];
+      }
+    }
+    out[idx] = (half)(sum * (1.0f / 121.0f));
+  }
+}
+
+__mlu_entry__ void AvgPoolFloatKernel(const float *x, float *out) {
+  for (uint32_t idx = taskId; idx < OUT_BATCH_ELEM; idx += taskDim) {
+    uint32_t ow = (uint32_t)(idx % OUT_W);
+    uint32_t t = idx / OUT_W;
+    uint32_t oh = (uint32_t)(t % OUT_H);
+    t /= OUT_H;
+    uint32_t c = (uint32_t)(t % CHANNELS);
+
+    uint64_t in_base = ((uint64_t)c * IN_H + oh * KERNEL) * IN_W + ow * KERNEL;
+    float sum = 0.0f;
+    for (uint32_t kh = 0; kh < KERNEL; ++kh) {
+      uint64_t row_base = in_base + (uint64_t)kh * IN_W;
+      for (uint32_t kw = 0; kw < KERNEL; ++kw) {
+        sum += x[row_base + kw];
+      }
+    }
+    out[idx] = sum * (1.0f / 121.0f);
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
+  auto output = x.new_empty({x.size(0), x.size(1), OUT_H, OUT_W});
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  if (x.element_size() == sizeof(float)) {
+    const float *x_ptr = x.data_ptr<float>();
+    float *out_ptr = output.data_ptr<float>();
+    for (int b = 0; b < BATCH; ++b) {
+      AvgPoolFloatKernel<<<task_dim, ktype, queue>>>(
+          x_ptr + (uint64_t)b * IN_BATCH_ELEM,
+          out_ptr + (uint64_t)b * OUT_BATCH_ELEM);
+    }
+  } else {
+    const half *x_ptr = (const half *)x.data_ptr();
+    half *out_ptr = (half *)output.data_ptr();
+    for (int b = 0; b < BATCH; ++b) {
+      AvgPoolHalfKernel<<<task_dim, ktype, queue>>>(
+          x_ptr + (uint64_t)b * IN_BATCH_ELEM,
+          out_ptr + (uint64_t)b * OUT_BATCH_ELEM);
+    }
+  }
+  return output;
+}

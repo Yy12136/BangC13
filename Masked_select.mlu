@@ -1,0 +1,115 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <vector>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define TOTAL_ELEM 1048576
+#define TASK_NUM 128
+#define CHUNK_ELEM 8192
+
+__mlu_entry__ void CountHalfKernel(const half *input, int32_t *counts,
+                                   float threshold) {
+  __nram__ half nram_x[CHUNK_ELEM];
+  uint32_t start = taskId * CHUNK_ELEM;
+  uint32_t count = 0;
+
+  __memcpy(nram_x, input + start, CHUNK_ELEM * sizeof(half), GDRAM2NRAM);
+  __sync_compute();
+  for (uint32_t i = 0; i < CHUNK_ELEM; ++i) {
+    if ((float)nram_x[i] > threshold) ++count;
+  }
+  counts[taskId] = (int32_t)count;
+}
+
+__mlu_entry__ void CountFloatKernel(const float *input, int32_t *counts,
+                                    float threshold) {
+  __nram__ float nram_x[CHUNK_ELEM];
+  uint32_t start = taskId * CHUNK_ELEM;
+  uint32_t count = 0;
+
+  __memcpy(nram_x, input + start, CHUNK_ELEM * sizeof(float), GDRAM2NRAM);
+  __sync_compute();
+  for (uint32_t i = 0; i < CHUNK_ELEM; ++i) {
+    if (nram_x[i] > threshold) ++count;
+  }
+  counts[taskId] = (int32_t)count;
+}
+
+__mlu_entry__ void SelectHalfKernel(const half *input, const int32_t *offsets,
+                                    half *output, float threshold) {
+  __nram__ half nram_x[CHUNK_ELEM];
+  uint32_t start = taskId * CHUNK_ELEM;
+  uint32_t out_pos = (uint32_t)offsets[taskId];
+
+  __memcpy(nram_x, input + start, CHUNK_ELEM * sizeof(half), GDRAM2NRAM);
+  __sync_compute();
+  for (uint32_t i = 0; i < CHUNK_ELEM; ++i) {
+    half v = nram_x[i];
+    if ((float)v > threshold) {
+      output[out_pos++] = v;
+    }
+  }
+}
+
+__mlu_entry__ void SelectFloatKernel(const float *input, const int32_t *offsets,
+                                     float *output, float threshold) {
+  __nram__ float nram_x[CHUNK_ELEM];
+  uint32_t start = taskId * CHUNK_ELEM;
+  uint32_t out_pos = (uint32_t)offsets[taskId];
+
+  __memcpy(nram_x, input + start, CHUNK_ELEM * sizeof(float), GDRAM2NRAM);
+  __sync_compute();
+  for (uint32_t i = 0; i < CHUNK_ELEM; ++i) {
+    float v = nram_x[i];
+    if (v > threshold) {
+      output[out_pos++] = v;
+    }
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor input, double threshold) {
+  auto counts = input.new_empty({TASK_NUM}, input.options().dtype(torch::kInt));
+  auto offsets = input.new_empty({TASK_NUM}, input.options().dtype(torch::kInt));
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+  float threshold_f = (float)threshold;
+
+  if (input.element_size() == sizeof(float)) {
+    CountFloatKernel<<<task_dim, ktype, queue>>>(
+        input.data_ptr<float>(), counts.data_ptr<int32_t>(), threshold_f);
+  } else {
+    CountHalfKernel<<<task_dim, ktype, queue>>>(
+        (const half *)input.data_ptr(), counts.data_ptr<int32_t>(), threshold_f);
+  }
+
+  std::vector<int32_t> host_counts(TASK_NUM);
+  cnrtQueueSync(queue);
+  cnrtMemcpy(host_counts.data(), counts.data_ptr<int32_t>(),
+             TASK_NUM * sizeof(int32_t), cnrtMemcpyDevToHost);
+
+  std::vector<int32_t> host_offsets(TASK_NUM);
+  int32_t total = 0;
+  for (int i = 0; i < TASK_NUM; ++i) {
+    host_offsets[i] = total;
+    total += host_counts[i];
+  }
+
+  auto output = input.new_empty({total});
+  cnrtMemcpy(offsets.data_ptr<int32_t>(), host_offsets.data(),
+             TASK_NUM * sizeof(int32_t), cnrtMemcpyHostToDev);
+
+  if (input.element_size() == sizeof(float)) {
+    SelectFloatKernel<<<task_dim, ktype, queue>>>(
+        input.data_ptr<float>(), offsets.data_ptr<int32_t>(),
+        output.data_ptr<float>(), threshold_f);
+  } else {
+    SelectHalfKernel<<<task_dim, ktype, queue>>>(
+        (const half *)input.data_ptr(), offsets.data_ptr<int32_t>(),
+        (half *)output.data_ptr(), threshold_f);
+  }
+  return output;
+}

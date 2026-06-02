@@ -1,0 +1,93 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define N_DIM 4096
+#define D_DIM 256
+#define OUT_ROWS 512
+#define TASK_NUM 32
+
+__mlu_entry__ void ZeroFloatKernel(float *out, uint32_t total) {
+  __nram__ float nram_zero[D_DIM];
+  __bang_write_value(nram_zero, D_DIM, 0.0f);
+  for (uint32_t start = taskId * D_DIM; start < total; start += taskDim * D_DIM) {
+    __memcpy(out + start, nram_zero, D_DIM * sizeof(float), NRAM2GDRAM);
+  }
+}
+
+__mlu_entry__ void ZeroHalfKernel(half *out, uint32_t total) {
+  __nram__ half nram_zero[D_DIM];
+  __bang_write_value(nram_zero, D_DIM, (half)0.0f);
+  for (uint32_t start = taskId * D_DIM; start < total; start += taskDim * D_DIM) {
+    __memcpy(out + start, nram_zero, D_DIM * sizeof(half), NRAM2GDRAM);
+  }
+}
+
+__mlu_entry__ void ScatterAddFloatKernel(const float *src, const int64_t *index,
+                                         float *out) {
+  __nram__ float nram_src[D_DIM];
+
+  for (uint32_t row = taskId; row < N_DIM; row += taskDim) {
+    int64_t out_row = index[row];
+    __memcpy(nram_src, src + row * D_DIM, D_DIM * sizeof(float), GDRAM2NRAM);
+    __bang_atomic_reduce_add(out + out_row * D_DIM, nram_src, D_DIM);
+  }
+}
+
+__mlu_entry__ void ScatterAddHalfKernel(const half *src, const int64_t *index,
+                                        half *out) {
+  __nram__ half nram_src[D_DIM];
+
+  for (uint32_t row = taskId; row < N_DIM; row += taskDim) {
+    int64_t out_row = index[row];
+    __memcpy(nram_src, src + row * D_DIM, D_DIM * sizeof(half), GDRAM2NRAM);
+    __bang_atomic_reduce_add(out + out_row * D_DIM, nram_src, D_DIM);
+  }
+}
+
+__mlu_entry__ void ScatterAddHalfDeterministicKernel(const half *src,
+                                                     const int64_t *index,
+                                                     half *out) {
+  __nram__ half nram_src[D_DIM];
+  __nram__ float nram_acc[D_DIM];
+  __nram__ float nram_tmp[D_DIM];
+  __nram__ half nram_out[D_DIM];
+
+  for (uint32_t out_row = taskId; out_row < OUT_ROWS; out_row += taskDim) {
+    __bang_write_value(nram_acc, D_DIM, 0.0f);
+    for (uint32_t row = 0; row < N_DIM; ++row) {
+      if ((uint32_t)index[row] == out_row) {
+        __memcpy(nram_src, src + row * D_DIM, D_DIM * sizeof(half),
+                 GDRAM2NRAM);
+        __bang_half2float(nram_tmp, nram_src, D_DIM);
+        __bang_add(nram_acc, nram_acc, nram_tmp, D_DIM);
+      }
+    }
+    __bang_float2half_rn(nram_out, nram_acc, D_DIM);
+    __memcpy(out + out_row * D_DIM, nram_out, D_DIM * sizeof(half),
+             NRAM2GDRAM);
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
+  auto output = src.new_empty({dim_size, src.size(1)});
+  uint32_t total = (uint32_t)(dim_size * src.size(1));
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  if (src.element_size() == sizeof(float)) {
+    ZeroFloatKernel<<<task_dim, ktype, queue>>>(output.data_ptr<float>(), total);
+    ScatterAddFloatKernel<<<task_dim, ktype, queue>>>(
+        src.data_ptr<float>(), index.data_ptr<int64_t>(),
+        output.data_ptr<float>());
+  } else {
+    ScatterAddHalfDeterministicKernel<<<task_dim, ktype, queue>>>(
+        (const half *)src.data_ptr(), index.data_ptr<int64_t>(),
+        (half *)output.data_ptr());
+  }
+  return output;
+}

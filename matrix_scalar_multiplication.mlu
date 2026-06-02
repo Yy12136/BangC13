@@ -1,0 +1,60 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define TILE_ELEM 65536
+#define TASK_NUM 32
+
+__mlu_entry__ void MatrixScalarMulFloatKernel(const float *a, float *out,
+                                              uint32_t total, float s) {
+  __nram__ float nram_a[TILE_ELEM];
+  __nram__ float nram_out[TILE_ELEM];
+
+  for (uint32_t start = taskId * TILE_ELEM; start < total;
+       start += taskDim * TILE_ELEM) {
+    uint32_t tile = total - start;
+    if (tile > TILE_ELEM) tile = TILE_ELEM;
+
+    __memcpy(nram_a, a + start, tile * sizeof(float), GDRAM2NRAM);
+    __bang_mul_scalar(nram_out, nram_a, s, tile);
+    __memcpy(out + start, nram_out, tile * sizeof(float), NRAM2GDRAM);
+  }
+}
+
+__mlu_entry__ void MatrixScalarMulHalfKernel(const half *a, half *out,
+                                             uint32_t total, half s) {
+  __nram__ half nram_a[TILE_ELEM];
+  __nram__ half nram_out[TILE_ELEM];
+
+  for (uint32_t start = taskId * TILE_ELEM; start < total;
+       start += taskDim * TILE_ELEM) {
+    uint32_t tile = total - start;
+    if (tile > TILE_ELEM) tile = TILE_ELEM;
+
+    __memcpy(nram_a, a + start, tile * sizeof(half), GDRAM2NRAM);
+    __bang_mul_scalar(nram_out, nram_a, s, tile);
+    __memcpy(out + start, nram_out, tile * sizeof(half), NRAM2GDRAM);
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor A, double s) {
+  auto output = A.new_empty(A.sizes());
+  uint32_t total = (uint32_t)A.numel();
+  if (total == 0) return output;
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  if (A.element_size() == sizeof(float)) {
+    MatrixScalarMulFloatKernel<<<task_dim, ktype, queue>>>(
+        A.data_ptr<float>(), output.data_ptr<float>(), total, (float)s);
+  } else {
+    MatrixScalarMulHalfKernel<<<task_dim, ktype, queue>>>(
+        (const half *)A.data_ptr(), (half *)output.data_ptr(), total,
+        (half)((float)s));
+  }
+  return output;
+}

@@ -1,0 +1,236 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define BATCH 16
+#define CHANNELS 64
+#define HEIGHT 256
+#define WIDTH 256
+#define HW (HEIGHT * WIDTH)
+#define CHANNEL_ELEM (BATCH * HW)
+#define TOTAL_ELEM (BATCH * CHANNELS * HW)
+#define REDUCE_CHUNKS 16
+#define REDUCE_TASKS (CHANNELS * REDUCE_CHUNKS)
+#define APPLY_TASKS 128
+#define TILE_ELEM 8192
+#define EPSILON 0.00001f
+
+__mlu_entry__ void MeanPartialHalfKernel(const half *x, float *partials) {
+  __nram__ half nram_x_h[TILE_ELEM];
+  __nram__ float nram_x[TILE_ELEM];
+
+  uint32_t task = taskId;
+  uint32_t c = task / REDUCE_CHUNKS;
+  uint32_t n = task - c * REDUCE_CHUNKS;
+  uint32_t base = ((n * CHANNELS + c) * HEIGHT) * WIDTH;
+  float sum = 0.0f;
+
+  for (uint32_t offset = 0; offset < HW; offset += TILE_ELEM) {
+    __memcpy(nram_x_h, x + base + offset, TILE_ELEM * sizeof(half),
+             GDRAM2NRAM);
+    __bang_half2float(nram_x, nram_x_h, TILE_ELEM);
+    __sync_compute();
+    for (uint32_t i = 0; i < TILE_ELEM; ++i) {
+      sum += nram_x[i];
+    }
+  }
+  nram_x[0] = sum;
+  __memcpy(partials + task, nram_x, sizeof(float), NRAM2GDRAM);
+}
+
+__mlu_entry__ void MeanPartialFloatKernel(const float *x, float *partials) {
+  __nram__ float nram_x[TILE_ELEM];
+
+  uint32_t task = taskId;
+  uint32_t c = task / REDUCE_CHUNKS;
+  uint32_t n = task - c * REDUCE_CHUNKS;
+  uint32_t base = ((n * CHANNELS + c) * HEIGHT) * WIDTH;
+  float sum = 0.0f;
+
+  for (uint32_t offset = 0; offset < HW; offset += TILE_ELEM) {
+    __memcpy(nram_x, x + base + offset, TILE_ELEM * sizeof(float),
+             GDRAM2NRAM);
+    __sync_compute();
+    for (uint32_t i = 0; i < TILE_ELEM; ++i) {
+      sum += nram_x[i];
+    }
+  }
+  nram_x[0] = sum;
+  __memcpy(partials + task, nram_x, sizeof(float), NRAM2GDRAM);
+}
+
+__mlu_entry__ void MeanReduceKernel(const float *partials, float *mean) {
+  __nram__ float nram_vals[64];
+
+  uint32_t c = taskId;
+  __memcpy(nram_vals, partials + c * REDUCE_CHUNKS,
+           REDUCE_CHUNKS * sizeof(float), GDRAM2NRAM);
+  __sync_compute();
+  float sum = 0.0f;
+  for (uint32_t i = 0; i < REDUCE_CHUNKS; ++i) {
+    sum += nram_vals[i];
+  }
+  nram_vals[0] = sum / (float)CHANNEL_ELEM;
+  __memcpy(mean + c, nram_vals, sizeof(float), NRAM2GDRAM);
+}
+
+__mlu_entry__ void VarPartialHalfKernel(const half *x, const float *mean,
+                                        float *partials) {
+  __nram__ half nram_x_h[TILE_ELEM];
+  __nram__ float nram_x[TILE_ELEM];
+  __nram__ float nram_param[64];
+
+  uint32_t task = taskId;
+  uint32_t c = task / REDUCE_CHUNKS;
+  uint32_t n = task - c * REDUCE_CHUNKS;
+  uint32_t base = ((n * CHANNELS + c) * HEIGHT) * WIDTH;
+  __memcpy(nram_param, mean + c, sizeof(float), GDRAM2NRAM);
+  float m = nram_param[0];
+  float sumsq = 0.0f;
+
+  for (uint32_t offset = 0; offset < HW; offset += TILE_ELEM) {
+    __memcpy(nram_x_h, x + base + offset, TILE_ELEM * sizeof(half),
+             GDRAM2NRAM);
+    __bang_half2float(nram_x, nram_x_h, TILE_ELEM);
+    __bang_sub_scalar(nram_x, nram_x, m, TILE_ELEM);
+    __bang_mul(nram_x, nram_x, nram_x, TILE_ELEM);
+    __sync_compute();
+    for (uint32_t i = 0; i < TILE_ELEM; ++i) {
+      sumsq += nram_x[i];
+    }
+  }
+  nram_x[0] = sumsq;
+  __memcpy(partials + task, nram_x, sizeof(float), NRAM2GDRAM);
+}
+
+__mlu_entry__ void VarPartialFloatKernel(const float *x, const float *mean,
+                                         float *partials) {
+  __nram__ float nram_x[TILE_ELEM];
+  __nram__ float nram_param[64];
+
+  uint32_t task = taskId;
+  uint32_t c = task / REDUCE_CHUNKS;
+  uint32_t n = task - c * REDUCE_CHUNKS;
+  uint32_t base = ((n * CHANNELS + c) * HEIGHT) * WIDTH;
+  __memcpy(nram_param, mean + c, sizeof(float), GDRAM2NRAM);
+  float m = nram_param[0];
+  float sumsq = 0.0f;
+
+  for (uint32_t offset = 0; offset < HW; offset += TILE_ELEM) {
+    __memcpy(nram_x, x + base + offset, TILE_ELEM * sizeof(float),
+             GDRAM2NRAM);
+    __bang_sub_scalar(nram_x, nram_x, m, TILE_ELEM);
+    __bang_mul(nram_x, nram_x, nram_x, TILE_ELEM);
+    __sync_compute();
+    for (uint32_t i = 0; i < TILE_ELEM; ++i) {
+      sumsq += nram_x[i];
+    }
+  }
+  nram_x[0] = sumsq;
+  __memcpy(partials + task, nram_x, sizeof(float), NRAM2GDRAM);
+}
+
+__mlu_entry__ void InvStdReduceKernel(const float *partials, float *invstd) {
+  __nram__ float nram_vals[64];
+
+  uint32_t c = taskId;
+  __memcpy(nram_vals, partials + c * REDUCE_CHUNKS,
+           REDUCE_CHUNKS * sizeof(float), GDRAM2NRAM);
+  __sync_compute();
+  float sumsq = 0.0f;
+  for (uint32_t i = 0; i < REDUCE_CHUNKS; ++i) {
+    sumsq += nram_vals[i];
+  }
+  nram_vals[0] = 1.0f / sqrtf(sumsq / (float)CHANNEL_ELEM + EPSILON);
+  __memcpy(invstd + c, nram_vals, sizeof(float), NRAM2GDRAM);
+}
+
+__mlu_entry__ void ApplyHalfKernel(const half *x, const float *mean,
+                                   const float *invstd, half *out) {
+  __nram__ half nram_x_h[TILE_ELEM];
+  __nram__ half nram_out_h[TILE_ELEM];
+  __nram__ float nram_x[TILE_ELEM];
+  __nram__ float nram_param[64];
+
+  for (uint32_t start = taskId * TILE_ELEM; start < TOTAL_ELEM;
+       start += taskDim * TILE_ELEM) {
+    uint32_t inner = start % (CHANNELS * HW);
+    uint32_t c = inner / HW;
+    __memcpy(nram_param, mean + c, sizeof(float), GDRAM2NRAM);
+    float m = nram_param[0];
+    __memcpy(nram_param, invstd + c, sizeof(float), GDRAM2NRAM);
+    float s = nram_param[0];
+
+    __memcpy(nram_x_h, x + start, TILE_ELEM * sizeof(half), GDRAM2NRAM);
+    __bang_half2float(nram_x, nram_x_h, TILE_ELEM);
+    __bang_sub_scalar(nram_x, nram_x, m, TILE_ELEM);
+    __bang_mul_scalar(nram_x, nram_x, s, TILE_ELEM);
+    __bang_float2half_rn(nram_out_h, nram_x, TILE_ELEM);
+    __memcpy(out + start, nram_out_h, TILE_ELEM * sizeof(half), NRAM2GDRAM);
+  }
+}
+
+__mlu_entry__ void ApplyFloatKernel(const float *x, const float *mean,
+                                    const float *invstd, float *out) {
+  __nram__ float nram_x[TILE_ELEM];
+  __nram__ float nram_param[64];
+
+  for (uint32_t start = taskId * TILE_ELEM; start < TOTAL_ELEM;
+       start += taskDim * TILE_ELEM) {
+    uint32_t inner = start % (CHANNELS * HW);
+    uint32_t c = inner / HW;
+    __memcpy(nram_param, mean + c, sizeof(float), GDRAM2NRAM);
+    float m = nram_param[0];
+    __memcpy(nram_param, invstd + c, sizeof(float), GDRAM2NRAM);
+    float s = nram_param[0];
+
+    __memcpy(nram_x, x + start, TILE_ELEM * sizeof(float), GDRAM2NRAM);
+    __bang_sub_scalar(nram_x, nram_x, m, TILE_ELEM);
+    __bang_mul_scalar(nram_x, nram_x, s, TILE_ELEM);
+    __memcpy(out + start, nram_x, TILE_ELEM * sizeof(float), NRAM2GDRAM);
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int num_features) {
+  auto output = x.new_empty(x.sizes());
+  auto partials = x.new_empty({num_features, REDUCE_CHUNKS},
+                              x.options().dtype(torch::kFloat));
+  auto mean = x.new_empty({num_features}, x.options().dtype(torch::kFloat));
+  auto invstd = x.new_empty({num_features}, x.options().dtype(torch::kFloat));
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t reduce_partial_dim = {REDUCE_TASKS, 1, 1};
+  cnrtDim3_t reduce_final_dim = {CHANNELS, 1, 1};
+  cnrtDim3_t apply_dim = {APPLY_TASKS, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  if (x.element_size() == sizeof(float)) {
+    MeanPartialFloatKernel<<<reduce_partial_dim, ktype, queue>>>(
+        x.data_ptr<float>(), partials.data_ptr<float>());
+    MeanReduceKernel<<<reduce_final_dim, ktype, queue>>>(
+        partials.data_ptr<float>(), mean.data_ptr<float>());
+    VarPartialFloatKernel<<<reduce_partial_dim, ktype, queue>>>(
+        x.data_ptr<float>(), mean.data_ptr<float>(), partials.data_ptr<float>());
+    InvStdReduceKernel<<<reduce_final_dim, ktype, queue>>>(
+        partials.data_ptr<float>(), invstd.data_ptr<float>());
+    ApplyFloatKernel<<<apply_dim, ktype, queue>>>(
+        x.data_ptr<float>(), mean.data_ptr<float>(), invstd.data_ptr<float>(),
+        output.data_ptr<float>());
+  } else {
+    MeanPartialHalfKernel<<<reduce_partial_dim, ktype, queue>>>(
+        (const half *)x.data_ptr(), partials.data_ptr<float>());
+    MeanReduceKernel<<<reduce_final_dim, ktype, queue>>>(
+        partials.data_ptr<float>(), mean.data_ptr<float>());
+    VarPartialHalfKernel<<<reduce_partial_dim, ktype, queue>>>(
+        (const half *)x.data_ptr(), mean.data_ptr<float>(),
+        partials.data_ptr<float>());
+    InvStdReduceKernel<<<reduce_final_dim, ktype, queue>>>(
+        partials.data_ptr<float>(), invstd.data_ptr<float>());
+    ApplyHalfKernel<<<apply_dim, ktype, queue>>>(
+        (const half *)x.data_ptr(), mean.data_ptr<float>(),
+        invstd.data_ptr<float>(), (half *)output.data_ptr());
+  }
+  return output;
+}

@@ -1,0 +1,110 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define BATCH 16
+#define IN_C 64
+#define OUT_C 128
+#define H 128
+#define W 128
+#define KERNEL 3
+#define DILATION 2
+#define PADDING 2
+#define TILE_PIX 256
+#define TASK_NUM 512
+
+__mlu_entry__ void DilatedConvPointwiseKernel(const half *x, const half *kernel,
+                                              float *out) {
+  __nram__ half x_h[TILE_PIX * IN_C];
+  __nram__ float x_f[TILE_PIX * IN_C];
+  __nram__ half k_h[OUT_C * IN_C];
+  __nram__ float k_plain[OUT_C * IN_C];
+  __nram__ float k_reorder[OUT_C * IN_C];
+  __wram__ float k_w[OUT_C * IN_C];
+  __nram__ float y[TILE_PIX * OUT_C];
+  __nram__ float acc[TILE_PIX * OUT_C];
+
+  const uint32_t spatial = H * W;
+  const uint32_t tiles = spatial / TILE_PIX;
+  const uint32_t jobs = BATCH * tiles;
+
+  for (uint32_t job = taskId; job < jobs; job += taskDim) {
+    uint32_t tile = job % tiles;
+    uint32_t b = job / tiles;
+    uint32_t pix0 = tile * TILE_PIX;
+    __bang_write_value(acc, TILE_PIX * OUT_C, 0.0f);
+
+    for (uint32_t kh = 0; kh < KERNEL; ++kh) {
+      for (uint32_t kw = 0; kw < KERNEL; ++kw) {
+        for (uint32_t p = 0; p < TILE_PIX; ++p) {
+          uint32_t s = pix0 + p;
+          uint32_t oh = s / W;
+          uint32_t ow = s - oh * W;
+          int32_t ih = (int32_t)oh + (int32_t)kh * DILATION - PADDING;
+          int32_t iw = (int32_t)ow + (int32_t)kw * DILATION - PADDING;
+          for (uint32_t ic = 0; ic < IN_C; ++ic) {
+            uint32_t dst = p * IN_C + ic;
+            if (ih < 0 || ih >= H || iw < 0 || iw >= W) {
+              x_h[dst] = (half)0.0f;
+            } else {
+              x_h[dst] = x[((uint64_t)b * IN_C + ic) * H * W +
+                           (uint32_t)ih * W + (uint32_t)iw];
+            }
+          }
+        }
+        __bang_half2float(x_f, x_h, TILE_PIX * IN_C);
+
+        for (uint32_t oc = 0; oc < OUT_C; ++oc) {
+          for (uint32_t ic = 0; ic < IN_C; ++ic) {
+            k_h[oc * IN_C + ic] =
+                kernel[((oc * IN_C + ic) * KERNEL + kh) * KERNEL + kw];
+          }
+        }
+        __bang_half2float(k_plain, k_h, OUT_C * IN_C);
+
+        uint32_t idx = 0;
+        for (uint32_t i = 0; i < 64; i += 4) {
+          for (uint32_t block = 0; block < OUT_C / 64; ++block) {
+            for (uint32_t m = 0; m < 4; ++m) {
+              uint32_t oc = i + block * 64 + m;
+              for (uint32_t ic = 0; ic < IN_C; ++ic) {
+                k_reorder[idx++] = k_plain[oc * IN_C + ic];
+              }
+            }
+          }
+        }
+        __memcpy(k_w, k_reorder, OUT_C * IN_C * sizeof(float), NRAM2WRAM);
+
+        __bang_write_value(y, TILE_PIX * OUT_C, 0.0f);
+        __bang_conv(y, x_f, k_w, IN_C, TILE_PIX, 1, 1, 1, 1, 1, OUT_C);
+        __bang_add(acc, acc, y, TILE_PIX * OUT_C);
+      }
+    }
+
+    for (uint32_t p = 0; p < TILE_PIX; ++p) {
+      uint32_t s = pix0 + p;
+      for (uint32_t oc = 0; oc < OUT_C; ++oc) {
+        out[((uint64_t)b * OUT_C + oc) * spatial + s] =
+            acc[p * OUT_C + oc];
+      }
+    }
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, int in_channels,
+                        int out_channels, int kernel_size, int dilation,
+                        int padding) {
+  auto output = torch::empty({x.size(0), out_channels, x.size(2), x.size(3)},
+                             x.options().dtype(torch::kFloat));
+  if (x.numel() == 0) return output;
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+  DilatedConvPointwiseKernel<<<task_dim, ktype, queue>>>(
+      (const half *)x.data_ptr(), (const half *)kernel.data_ptr(),
+      output.data_ptr<float>());
+  return output;
+}

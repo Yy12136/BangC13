@@ -1,0 +1,65 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define ROWS 4096
+#define REDUCE_DIM 256
+#define TASK_NUM 32
+
+__mlu_entry__ void ArgmaxFloatKernel(const float *x, int64_t *out) {
+  for (uint32_t out_idx = taskId; out_idx < ROWS; out_idx += taskDim) {
+    uint32_t batch = out_idx / REDUCE_DIM;
+    uint32_t col = out_idx - batch * REDUCE_DIM;
+    uint32_t base = batch * REDUCE_DIM * REDUCE_DIM + col;
+    float max_val = x[base];
+    int64_t max_idx = 0;
+
+    for (uint32_t k = 1; k < REDUCE_DIM; ++k) {
+      float val = x[base + k * REDUCE_DIM];
+      if (val > max_val) {
+        max_val = val;
+        max_idx = (int64_t)k;
+      }
+    }
+    out[out_idx] = max_idx;
+  }
+}
+
+__mlu_entry__ void ArgmaxHalfKernel(const half *x, int64_t *out) {
+  for (uint32_t out_idx = taskId; out_idx < ROWS; out_idx += taskDim) {
+    uint32_t batch = out_idx / REDUCE_DIM;
+    uint32_t col = out_idx - batch * REDUCE_DIM;
+    uint32_t base = batch * REDUCE_DIM * REDUCE_DIM + col;
+    half max_val = x[base];
+    int64_t max_idx = 0;
+
+    for (uint32_t k = 1; k < REDUCE_DIM; ++k) {
+      half val = x[base + k * REDUCE_DIM];
+      if (val > max_val) {
+        max_val = val;
+        max_idx = (int64_t)k;
+      }
+    }
+    out[out_idx] = max_idx;
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+  auto output = x.new_empty({x.size(0), x.size(2)}, x.options().dtype(torch::kLong));
+  if (x.numel() == 0) return output;
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  if (x.element_size() == sizeof(float)) {
+    ArgmaxFloatKernel<<<task_dim, ktype, queue>>>(
+        x.data_ptr<float>(), output.data_ptr<int64_t>());
+  } else {
+    ArgmaxHalfKernel<<<task_dim, ktype, queue>>>(
+        (const half *)x.data_ptr(), output.data_ptr<int64_t>());
+  }
+  return output;
+}

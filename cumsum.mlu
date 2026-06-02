@@ -1,0 +1,60 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define ROWS 128
+#define COLS 4000
+#define ALIGNED_COLS 4032
+#define TASK_NUM 32
+
+__mlu_entry__ void CumsumFloatKernel(const float *x, float *out) {
+  __nram__ float nram_row[COLS];
+
+  for (uint32_t row = taskId; row < ROWS; row += taskDim) {
+    uint32_t base = row * COLS;
+    __memcpy(nram_row, x + base, COLS * sizeof(float), GDRAM2NRAM);
+    __sync_compute();
+    for (uint32_t i = 1; i < COLS; ++i) {
+      nram_row[i] += nram_row[i - 1];
+    }
+    __memcpy(out + base, nram_row, COLS * sizeof(float), NRAM2GDRAM);
+  }
+}
+
+__mlu_entry__ void CumsumHalfKernel(const half *x, float *out) {
+  __nram__ half nram_row_h[ALIGNED_COLS];
+  __nram__ float nram_row[ALIGNED_COLS];
+
+  for (uint32_t row = taskId; row < ROWS; row += taskDim) {
+    uint32_t base = row * COLS;
+    __memcpy(nram_row_h, x + base, COLS * sizeof(half), GDRAM2NRAM);
+    __bang_write_value(nram_row_h + COLS, ALIGNED_COLS - COLS, (half)0.0f);
+    __bang_half2float(nram_row, nram_row_h, ALIGNED_COLS);
+    for (uint32_t i = 1; i < COLS; ++i) {
+      nram_row[i] += nram_row[i - 1];
+    }
+    __memcpy(out + base, nram_row, COLS * sizeof(float), NRAM2GDRAM);
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+  auto output = x.element_size() == sizeof(float)
+                    ? x.new_empty(x.sizes())
+                    : torch::empty(x.sizes(), x.options().dtype(torch::kFloat));
+  if (x.numel() == 0) return output;
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  if (x.element_size() == sizeof(float)) {
+    CumsumFloatKernel<<<task_dim, ktype, queue>>>(
+        x.data_ptr<float>(), output.data_ptr<float>());
+  } else {
+    CumsumHalfKernel<<<task_dim, ktype, queue>>>(
+        (const half *)x.data_ptr(), output.data_ptr<float>());
+  }
+  return output;
+}

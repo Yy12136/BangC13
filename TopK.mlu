@@ -1,0 +1,98 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <float.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define ROWS 16
+#define COLS 1024
+#define TOP_K 10
+#define TASK_NUM 16
+
+__mlu_entry__ void TopKFloatKernel(const float *x, float *values,
+                                   int64_t *indices) {
+  __nram__ float top_vals[TOP_K];
+  __nram__ int32_t top_idx[TOP_K];
+
+  for (uint32_t row = taskId; row < ROWS; row += taskDim) {
+    for (uint32_t i = 0; i < TOP_K; ++i) {
+      top_vals[i] = -FLT_MAX;
+      top_idx[i] = 0;
+    }
+
+    uint32_t base = row * COLS;
+    for (uint32_t col = 0; col < COLS; ++col) {
+      float val = x[base + col];
+      if (val > top_vals[TOP_K - 1]) {
+        uint32_t pos = TOP_K - 1;
+        while (pos > 0 && val > top_vals[pos - 1]) {
+          top_vals[pos] = top_vals[pos - 1];
+          top_idx[pos] = top_idx[pos - 1];
+          --pos;
+        }
+        top_vals[pos] = val;
+        top_idx[pos] = (int32_t)col;
+      }
+    }
+
+    uint32_t out_base = row * TOP_K;
+    for (uint32_t i = 0; i < TOP_K; ++i) {
+      values[out_base + i] = top_vals[i];
+      indices[out_base + i] = (int64_t)top_idx[i];
+    }
+  }
+}
+
+__mlu_entry__ void TopKHalfKernel(const half *x, half *values,
+                                  int64_t *indices) {
+  __nram__ float top_vals[TOP_K];
+  __nram__ int32_t top_idx[TOP_K];
+
+  for (uint32_t row = taskId; row < ROWS; row += taskDim) {
+    for (uint32_t i = 0; i < TOP_K; ++i) {
+      top_vals[i] = -FLT_MAX;
+      top_idx[i] = 0;
+    }
+
+    uint32_t base = row * COLS;
+    for (uint32_t col = 0; col < COLS; ++col) {
+      float val = (float)x[base + col];
+      if (val > top_vals[TOP_K - 1]) {
+        uint32_t pos = TOP_K - 1;
+        while (pos > 0 && val > top_vals[pos - 1]) {
+          top_vals[pos] = top_vals[pos - 1];
+          top_idx[pos] = top_idx[pos - 1];
+          --pos;
+        }
+        top_vals[pos] = val;
+        top_idx[pos] = (int32_t)col;
+      }
+    }
+
+    uint32_t out_base = row * TOP_K;
+    for (uint32_t i = 0; i < TOP_K; ++i) {
+      values[out_base + i] = (half)top_vals[i];
+      indices[out_base + i] = (int64_t)top_idx[i];
+    }
+  }
+}
+
+std::vector<torch::Tensor> bang_func(torch::Tensor x, int k, int dim) {
+  auto values = x.new_empty({x.size(0), k});
+  auto indices = x.new_empty({x.size(0), k}, x.options().dtype(torch::kLong));
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  if (x.element_size() == sizeof(float)) {
+    TopKFloatKernel<<<task_dim, ktype, queue>>>(
+        x.data_ptr<float>(), values.data_ptr<float>(), indices.data_ptr<int64_t>());
+  } else {
+    TopKHalfKernel<<<task_dim, ktype, queue>>>(
+        (const half *)x.data_ptr(), (half *)values.data_ptr(),
+        indices.data_ptr<int64_t>());
+  }
+  return {values, indices};
+}

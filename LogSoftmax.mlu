@@ -1,0 +1,126 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <float.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define BATCH 16
+#define FEAT 16384
+#define TILE_ELEM 8192
+#define TASK_NUM 16
+
+__mlu_entry__ void LogSoftmaxFloatKernel(const float *x, float *out) {
+  __nram__ float nram_tile[TILE_ELEM];
+  __nram__ float nram_log[64];
+
+  for (uint32_t row = taskId; row < BATCH; row += taskDim) {
+    const uint32_t base = row * FEAT;
+    float row_max = -FLT_MAX;
+
+    for (uint32_t start = 0; start < FEAT; start += TILE_ELEM) {
+      __memcpy(nram_tile, x + base + start, TILE_ELEM * sizeof(float),
+               GDRAM2NRAM);
+      __sync_compute();
+      for (uint32_t i = 0; i < TILE_ELEM; ++i) {
+        if (nram_tile[i] > row_max) row_max = nram_tile[i];
+      }
+    }
+
+    float sum_exp = 0.0f;
+    for (uint32_t start = 0; start < FEAT; start += TILE_ELEM) {
+      __memcpy(nram_tile, x + base + start, TILE_ELEM * sizeof(float),
+               GDRAM2NRAM);
+      __bang_add_scalar(nram_tile, nram_tile, -row_max, TILE_ELEM);
+      __bang_active_exp(nram_tile, nram_tile, TILE_ELEM);
+      __sync_compute();
+      for (uint32_t i = 0; i < TILE_ELEM; ++i) {
+        sum_exp += nram_tile[i];
+      }
+    }
+
+    __bang_write_value(nram_log, 64, 1.0f);
+    nram_log[0] = sum_exp;
+    __bang_log2(nram_log, nram_log, 64);
+    __bang_mul_scalar(nram_log, nram_log, 0.6931471805599453f, 64);
+    __sync_compute();
+    float log_sum = nram_log[0];
+
+    for (uint32_t start = 0; start < FEAT; start += TILE_ELEM) {
+      __memcpy(nram_tile, x + base + start, TILE_ELEM * sizeof(float),
+               GDRAM2NRAM);
+      __bang_add_scalar(nram_tile, nram_tile, -(row_max + log_sum), TILE_ELEM);
+      __memcpy(out + base + start, nram_tile, TILE_ELEM * sizeof(float),
+               NRAM2GDRAM);
+    }
+  }
+}
+
+__mlu_entry__ void LogSoftmaxHalfKernel(const half *x, half *out) {
+  __nram__ half nram_half[TILE_ELEM];
+  __nram__ float nram_tile[TILE_ELEM];
+  __nram__ float nram_log[64];
+
+  for (uint32_t row = taskId; row < BATCH; row += taskDim) {
+    const uint32_t base = row * FEAT;
+    float row_max = -FLT_MAX;
+
+    for (uint32_t start = 0; start < FEAT; start += TILE_ELEM) {
+      __memcpy(nram_half, x + base + start, TILE_ELEM * sizeof(half),
+               GDRAM2NRAM);
+      __bang_half2float(nram_tile, nram_half, TILE_ELEM);
+      __sync_compute();
+      for (uint32_t i = 0; i < TILE_ELEM; ++i) {
+        if (nram_tile[i] > row_max) row_max = nram_tile[i];
+      }
+    }
+
+    float sum_exp = 0.0f;
+    for (uint32_t start = 0; start < FEAT; start += TILE_ELEM) {
+      __memcpy(nram_half, x + base + start, TILE_ELEM * sizeof(half),
+               GDRAM2NRAM);
+      __bang_half2float(nram_tile, nram_half, TILE_ELEM);
+      __bang_add_scalar(nram_tile, nram_tile, -row_max, TILE_ELEM);
+      __bang_active_exp(nram_tile, nram_tile, TILE_ELEM);
+      __sync_compute();
+      for (uint32_t i = 0; i < TILE_ELEM; ++i) {
+        sum_exp += nram_tile[i];
+      }
+    }
+
+    __bang_write_value(nram_log, 64, 1.0f);
+    nram_log[0] = sum_exp;
+    __bang_log2(nram_log, nram_log, 64);
+    __bang_mul_scalar(nram_log, nram_log, 0.6931471805599453f, 64);
+    __sync_compute();
+    float log_sum = nram_log[0];
+
+    for (uint32_t start = 0; start < FEAT; start += TILE_ELEM) {
+      __memcpy(nram_half, x + base + start, TILE_ELEM * sizeof(half),
+               GDRAM2NRAM);
+      __bang_half2float(nram_tile, nram_half, TILE_ELEM);
+      __bang_add_scalar(nram_tile, nram_tile, -(row_max + log_sum), TILE_ELEM);
+      __bang_float2half_rn(nram_half, nram_tile, TILE_ELEM);
+      __memcpy(out + base + start, nram_half, TILE_ELEM * sizeof(half),
+               NRAM2GDRAM);
+    }
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+  auto output = x.new_empty(x.sizes());
+  if (x.numel() == 0) return output;
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  if (x.element_size() == sizeof(float)) {
+    LogSoftmaxFloatKernel<<<task_dim, ktype, queue>>>(
+        x.data_ptr<float>(), output.data_ptr<float>());
+  } else {
+    LogSoftmaxHalfKernel<<<task_dim, ktype, queue>>>(
+        (const half *)x.data_ptr(), (half *)output.data_ptr());
+  }
+  return output;
+}

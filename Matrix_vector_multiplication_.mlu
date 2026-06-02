@@ -1,0 +1,93 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define M_DIM 256
+#define K_DIM 131072
+#define TILE_ELEM 8192
+#define TASK_NUM 32
+
+__mlu_entry__ void MatVecFloatKernel(const float *a, const float *b,
+                                     float *out) {
+  __nram__ float nram_a[TILE_ELEM];
+  __nram__ float nram_b[TILE_ELEM];
+  __nram__ float nram_prod[TILE_ELEM];
+
+  for (uint32_t row = taskId; row < M_DIM; row += taskDim) {
+    float sum = 0.0f;
+    float comp = 0.0f;
+    uint32_t row_base = row * K_DIM;
+
+    for (uint32_t k = 0; k < K_DIM; k += TILE_ELEM) {
+      __memcpy(nram_a, a + row_base + k, TILE_ELEM * sizeof(float),
+               GDRAM2NRAM);
+      __memcpy(nram_b, b + k, TILE_ELEM * sizeof(float), GDRAM2NRAM);
+      __bang_mul(nram_prod, nram_a, nram_b, TILE_ELEM);
+      __sync_compute();
+      for (uint32_t i = 0; i < TILE_ELEM; ++i) {
+        float y = nram_prod[i] - comp;
+        float t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
+      }
+    }
+
+    out[row] = sum;
+  }
+}
+
+__mlu_entry__ void MatVecHalfKernel(const half *a, const half *b, float *out) {
+  __nram__ half nram_a_h[TILE_ELEM];
+  __nram__ half nram_b_h[TILE_ELEM];
+  __nram__ float nram_a[TILE_ELEM];
+  __nram__ float nram_b[TILE_ELEM];
+  __nram__ float nram_prod[TILE_ELEM];
+
+  for (uint32_t row = taskId; row < M_DIM; row += taskDim) {
+    float sum = 0.0f;
+    float comp = 0.0f;
+    uint32_t row_base = row * K_DIM;
+
+    for (uint32_t k = 0; k < K_DIM; k += TILE_ELEM) {
+      __memcpy(nram_a_h, a + row_base + k, TILE_ELEM * sizeof(half),
+               GDRAM2NRAM);
+      __memcpy(nram_b_h, b + k, TILE_ELEM * sizeof(half), GDRAM2NRAM);
+      __bang_half2float(nram_a, nram_a_h, TILE_ELEM);
+      __bang_half2float(nram_b, nram_b_h, TILE_ELEM);
+      __bang_mul(nram_prod, nram_a, nram_b, TILE_ELEM);
+      __sync_compute();
+      for (uint32_t i = 0; i < TILE_ELEM; ++i) {
+        float y = nram_prod[i] - comp;
+        float t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
+      }
+    }
+
+    out[row] = sum;
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+  auto output = A.element_size() == sizeof(float)
+                    ? A.new_empty({A.size(0), B.size(1)})
+                    : torch::empty({A.size(0), B.size(1)},
+                                   A.options().dtype(torch::kFloat));
+  if (A.numel() == 0) return output;
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  if (A.element_size() == sizeof(float)) {
+    MatVecFloatKernel<<<task_dim, ktype, queue>>>(
+        A.data_ptr<float>(), B.data_ptr<float>(), output.data_ptr<float>());
+  } else {
+    MatVecHalfKernel<<<task_dim, ktype, queue>>>(
+        (const half *)A.data_ptr(), (const half *)B.data_ptr(),
+        output.data_ptr<float>());
+  }
+  return output;
+}

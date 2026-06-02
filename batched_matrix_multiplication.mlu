@@ -1,0 +1,91 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define BATCH 128
+#define M_DIM 512
+#define K_DIM 1024
+#define N_DIM 2048
+
+#define M_TILE 16
+#define K_TILE 256
+#define N_TILE 64
+#define TASK_NUM 32
+
+#define CONVERT_POS -15
+#define MATMUL_POS -30
+
+__mlu_entry__ void BmmHalfKernel(const half *A, const half *B, float *C) {
+  __nram__ half a_h[M_TILE * K_TILE];
+  __nram__ half b_h[K_TILE * N_TILE];
+  __nram__ int16_t a_i[M_TILE * K_TILE];
+  __nram__ int16_t b_i_row[K_TILE * N_TILE];
+  __nram__ int16_t b_i_col[K_TILE * N_TILE];
+  __wram__ int16_t b_w[K_TILE * N_TILE];
+  __nram__ float acc[M_TILE * N_TILE];
+  __nram__ float part[M_TILE * N_TILE];
+
+  const uint32_t m_blocks = M_DIM / M_TILE;
+  const uint32_t n_blocks = N_DIM / N_TILE;
+  const uint32_t jobs = BATCH * m_blocks * n_blocks;
+
+  for (uint32_t job = taskId; job < jobs; job += taskDim) {
+    uint32_t nb = job % n_blocks;
+    uint32_t tmp = job / n_blocks;
+    uint32_t mb = tmp % m_blocks;
+    uint32_t batch = tmp / m_blocks;
+    uint32_t m_start = mb * M_TILE;
+    uint32_t n_start = nb * N_TILE;
+
+    __bang_write_value(acc, M_TILE * N_TILE, 0.0f);
+
+    for (uint32_t k_start = 0; k_start < K_DIM; k_start += K_TILE) {
+      const half *a_base = A + ((uint64_t)batch * M_DIM + m_start) * K_DIM + k_start;
+      const half *b_base = B + ((uint64_t)batch * K_DIM + k_start) * N_DIM + n_start;
+
+      for (uint32_t i = 0; i < M_TILE; ++i) {
+        __memcpy(a_h + i * K_TILE, a_base + (uint64_t)i * K_DIM,
+                 K_TILE * sizeof(half), GDRAM2NRAM);
+      }
+      for (uint32_t k = 0; k < K_TILE; ++k) {
+        __memcpy(b_h + k * N_TILE, b_base + (uint64_t)k * N_DIM,
+                 N_TILE * sizeof(half), GDRAM2NRAM);
+      }
+
+      __bang_half2int16_rn(a_i, a_h, M_TILE * K_TILE, CONVERT_POS);
+      __bang_half2int16_rn(b_i_row, b_h, K_TILE * N_TILE, CONVERT_POS);
+
+      for (uint32_t k = 0; k < K_TILE; ++k) {
+        for (uint32_t n = 0; n < N_TILE; ++n) {
+          b_i_col[n * K_TILE + k] = b_i_row[k * N_TILE + n];
+        }
+      }
+      __memcpy(b_w, b_i_col, K_TILE * N_TILE * sizeof(int16_t), NRAM2WRAM);
+
+      __bang_matmul(part, a_i, b_w, M_TILE, K_TILE, N_TILE, MATMUL_POS);
+      __bang_add(acc, acc, part, M_TILE * N_TILE);
+    }
+
+    float *c_base = C + ((uint64_t)batch * M_DIM + m_start) * N_DIM + n_start;
+    for (uint32_t i = 0; i < M_TILE; ++i) {
+      __memcpy(c_base + (uint64_t)i * N_DIM, acc + i * N_TILE,
+               N_TILE * sizeof(float), NRAM2GDRAM);
+    }
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+  auto output = torch::empty({A.size(0), A.size(1), B.size(2)},
+                             A.options().dtype(torch::kFloat));
+  if (A.numel() == 0) return output;
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+  BmmHalfKernel<<<task_dim, ktype, queue>>>((const half *)A.data_ptr(),
+                                            (const half *)B.data_ptr(),
+                                            output.data_ptr<float>());
+  return output;
+}

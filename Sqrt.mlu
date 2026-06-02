@@ -1,0 +1,63 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define FLOAT_TILE_ELEM 65536
+#define HALF_TILE_ELEM 32768
+#define TASK_NUM 32
+
+__mlu_entry__ void SqrtAbsFloatKernel(const float *x, float *out,
+                                      uint32_t total) {
+  __nram__ float nram_x[FLOAT_TILE_ELEM];
+
+  for (uint32_t start = taskId * FLOAT_TILE_ELEM; start < total;
+       start += taskDim * FLOAT_TILE_ELEM) {
+    uint32_t tile = total - start;
+    if (tile > FLOAT_TILE_ELEM) tile = FLOAT_TILE_ELEM;
+
+    __memcpy(nram_x, x + start, tile * sizeof(float), GDRAM2NRAM);
+    __bang_abs(nram_x, nram_x, tile);
+    __bang_sqrt(nram_x, nram_x, tile);
+    __memcpy(out + start, nram_x, tile * sizeof(float), NRAM2GDRAM);
+  }
+}
+
+__mlu_entry__ void SqrtAbsHalfKernel(const half *x, half *out,
+                                     uint32_t total) {
+  __nram__ half nram_h[HALF_TILE_ELEM];
+  __nram__ float nram_f[HALF_TILE_ELEM];
+
+  for (uint32_t start = taskId * HALF_TILE_ELEM; start < total;
+       start += taskDim * HALF_TILE_ELEM) {
+    uint32_t tile = total - start;
+    if (tile > HALF_TILE_ELEM) tile = HALF_TILE_ELEM;
+
+    __memcpy(nram_h, x + start, tile * sizeof(half), GDRAM2NRAM);
+    __bang_half2float(nram_f, nram_h, tile);
+    __bang_abs(nram_f, nram_f, tile);
+    __bang_sqrt(nram_f, nram_f, tile);
+    __bang_float2half_rn(nram_h, nram_f, tile);
+    __memcpy(out + start, nram_h, tile * sizeof(half), NRAM2GDRAM);
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x) {
+  auto output = x.new_empty(x.sizes());
+  uint32_t total = (uint32_t)x.numel();
+  if (total == 0) return output;
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  if (x.element_size() == sizeof(float)) {
+    SqrtAbsFloatKernel<<<task_dim, ktype, queue>>>(
+        x.data_ptr<float>(), output.data_ptr<float>(), total);
+  } else {
+    SqrtAbsHalfKernel<<<task_dim, ktype, queue>>>(
+        (const half *)x.data_ptr(), (half *)output.data_ptr(), total);
+  }
+  return output;
+}

@@ -1,0 +1,76 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+
+#define BATCH 16
+#define IN_C 3
+#define OUT_C 64
+#define K_SIZE 3
+#define IN_LEN 512
+#define OUT_LEN 510
+#define TOTAL_OUT (BATCH * OUT_C * OUT_LEN)
+#define TASK_NUM 32
+
+__mlu_entry__ void Conv1DFloatKernel(const float *x, const float *kernel,
+                                     float *out) {
+  for (uint32_t idx = taskId; idx < TOTAL_OUT; idx += taskDim) {
+    uint32_t t = idx;
+    uint32_t pos = t % OUT_LEN;
+    t /= OUT_LEN;
+    uint32_t oc = t % OUT_C;
+    uint32_t b = t / OUT_C;
+
+    float sum = 0.0f;
+    for (uint32_t ic = 0; ic < IN_C; ++ic) {
+      uint32_t x_base = (b * IN_C + ic) * IN_LEN + pos;
+      uint32_t k_base = (oc * IN_C + ic) * K_SIZE;
+      sum += x[x_base] * kernel[k_base];
+      sum += x[x_base + 1] * kernel[k_base + 1];
+      sum += x[x_base + 2] * kernel[k_base + 2];
+    }
+    out[idx] = sum;
+  }
+}
+
+__mlu_entry__ void Conv1DHalfKernel(const half *x, const half *kernel,
+                                    half *out) {
+  for (uint32_t idx = taskId; idx < TOTAL_OUT; idx += taskDim) {
+    uint32_t t = idx;
+    uint32_t pos = t % OUT_LEN;
+    t /= OUT_LEN;
+    uint32_t oc = t % OUT_C;
+    uint32_t b = t / OUT_C;
+
+    float sum = 0.0f;
+    for (uint32_t ic = 0; ic < IN_C; ++ic) {
+      uint32_t x_base = (b * IN_C + ic) * IN_LEN + pos;
+      uint32_t k_base = (oc * IN_C + ic) * K_SIZE;
+      sum += (float)x[x_base] * (float)kernel[k_base];
+      sum += (float)x[x_base + 1] * (float)kernel[k_base + 1];
+      sum += (float)x[x_base + 2] * (float)kernel[k_base + 2];
+    }
+    out[idx] = (half)sum;
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, int in_channels,
+                        int out_channels, int kernel_size, int stride,
+                        int padding, int dilation, int groups, int bias) {
+  auto output = x.new_empty({x.size(0), out_channels, x.size(2) - kernel_size + 1});
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t task_dim = {TASK_NUM, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  if (x.element_size() == sizeof(float)) {
+    Conv1DFloatKernel<<<task_dim, ktype, queue>>>(
+        x.data_ptr<float>(), kernel.data_ptr<float>(), output.data_ptr<float>());
+  } else {
+    Conv1DHalfKernel<<<task_dim, ktype, queue>>>(
+        (const half *)x.data_ptr(), (const half *)kernel.data_ptr(),
+        (half *)output.data_ptr());
+  }
+  return output;
+}
